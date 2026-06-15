@@ -173,76 +173,6 @@ class MaxConnection:
 
 class TokenParser:
     @staticmethod
-    def find_password(text: str) -> str:
-        """Ищет пароль ВЕЗДЕ - в JSON, после JSON, в отдельных строках"""
-        
-        # 1. Ищем пароль после } и перед const customPayload
-        # Формат: ...JSON... пароль\nconst customPayload = "...";
-        match = re.search(r'\}\s+([A-Za-z0-9@#$%^&*!]+)\s*(?:const\s+customPayload|$)', text)
-        if match:
-            pwd = match.group(1)
-            if 3 <= len(pwd) <= 50:
-                logger.info(f"Password found after JSON: {pwd}")
-                return pwd
-        
-        # 2. Ищем в JSON полях password/pass/pwd
-        for pattern in [
-            r'"[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]"\s*:\s*"([^"]+)"',
-            r'"[Pp][Aa][Ss][Ss]"\s*:\s*"([^"]+)"',
-            r'"[Pp][Ww][Dd]"\s*:\s*"([^"]+)"',
-        ]:
-            match = re.search(pattern, text)
-            if match:
-                pwd = match.group(1)
-                if 3 <= len(pwd) <= 50:
-                    logger.info(f"Password found in JSON field: {pwd}")
-                    return pwd
-        
-        # 3. Ищем строку со спецсимволами (!@#$%^&*) - это почти всегда пароль
-        lines = text.strip().split('\n')
-        for line in lines:
-            line = line.strip()
-            if len(line) < 4 or len(line) > 50:
-                continue
-            if line.startswith('{') or line.startswith('const') or line.startswith('An_'):
-                continue
-            if re.search(r'[!@#$%^&*]', line):
-                logger.info(f"Password found by special chars: {line}")
-                return line
-        
-        # 4. Ищем строку которая выглядит как пароль (буквы + цифры, не телефон)
-        for line in lines:
-            line = line.strip()
-            if len(line) < 4 or len(line) > 50:
-                continue
-            if line.startswith('{') or line.startswith('const') or line.startswith('An_'):
-                continue
-            if line.startswith('+') or line.isdigit():
-                continue
-            if re.search(r'[A-Za-z]', line) and re.search(r'[0-9]', line):
-                logger.info(f"Password found by pattern: {line}")
-                return line
-        
-        # 5. Ищем пароль в самом токене (base64 части)
-        token_match = re.search(r'(An_[A-Za-z0-9\-_=+]{100,})', text)
-        if token_match:
-            token = token_match.group(1)
-            parts = re.split(r'[\._\-]', token)
-            for part in parts:
-                if len(part) < 8 or len(part) > 200:
-                    continue
-                for padding in ['', '=', '==', '===']:
-                    try:
-                        decoded = base64.b64decode(part + padding).decode('utf-8', errors='ignore')
-                        if 4 <= len(decoded) <= 30 and re.search(r'[!@#$%^&*]', decoded):
-                            logger.info(f"Password found in token base64: {decoded}")
-                            return decoded
-                    except:
-                        continue
-        
-        return ""
-    
-    @staticmethod
     def extract_token(text: str) -> str:
         match = re.search(r'"token"\s*:\s*"([^"]+)"', text)
         if match:
@@ -256,40 +186,6 @@ class TokenParser:
             if not token.startswith('{') and not token.startswith('const'):
                 return token
         return None
-    
-    @staticmethod
-    def extract_phone_from_json(data: dict) -> str:
-        for field in ["phone", "phoneNumber"]:
-            val = data.get(field, "")
-            if val:
-                return str(val)
-        token_profile = data.get("token_profile", {})
-        if isinstance(token_profile, dict):
-            phone = token_profile.get("phone", "")
-            if phone:
-                return str(phone)
-        user = data.get("user", {})
-        if isinstance(user, dict):
-            phone = user.get("phone", "")
-            if phone:
-                return str(phone)
-        return ""
-    
-    @staticmethod
-    def extract_device_info_from_json(data: dict) -> dict:
-        device_profile = data.get("device_profile", {})
-        if device_profile:
-            return device_profile
-        user_agent = data.get("userAgent", {})
-        if user_agent:
-            return user_agent
-        device_info = data.get("deviceInfo", {})
-        if device_info:
-            return device_info
-        device = data.get("device", {})
-        if device:
-            return device
-        return {}
     
     @staticmethod
     def extract_device_info(text: str) -> dict:
@@ -339,6 +235,49 @@ class TokenParser:
         return None
     
     @staticmethod
+    def extract_password(text: str) -> str:
+        """Ищет пароль в тексте"""
+        # Ищем после JSON перед const customPayload
+        match = re.search(r'\}\s*([A-Za-z0-9@#$%^&*!]+)\s*(?:const\s+customPayload|$)', text)
+        if match:
+            pwd = match.group(1)
+            if 6 <= len(pwd) <= 50:
+                return pwd
+        
+        # Ищем на следующей строке после }
+        match = re.search(r'\}\n\s*([A-Za-z0-9@#$%^&*!]+)', text)
+        if match:
+            pwd = match.group(1)
+            if 6 <= len(pwd) <= 50:
+                return pwd
+        
+        # Ищем строку со спецсимволами
+        lines = text.strip().split('\n')
+        for line in lines:
+            line = line.strip()
+            if len(line) < 6 or len(line) > 50:
+                continue
+            if line.startswith('{') or line.startswith('const') or line.startswith('An_'):
+                continue
+            if re.search(r'[!@#$%^&*]', line):
+                return line
+        
+        # Ищем строку после JSON
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+            if i > 0 and lines[i-1].strip().endswith('}'):
+                if 6 <= len(line) <= 50:
+                    if not line.startswith('const') and not line.startswith('An_') and not line.startswith('{'):
+                        has_letter = bool(re.search(r'[A-Za-z]', line))
+                        has_digit_or_special = bool(re.search(r'[0-9!@#$%^&*]', line))
+                        if has_letter and has_digit_or_special:
+                            return line
+        
+        return ""
+    
+    @staticmethod
     def parse_content(content: str) -> list:
         results = []
         
@@ -347,35 +286,30 @@ class TokenParser:
             data = json.loads(content)
             if isinstance(data, list):
                 for item in data:
-                    if isinstance(item, dict):
-                        parsed = TokenParser.parse_single_account(item)
-                        if parsed:
-                            results.append(parsed)
-                return results
+                    if isinstance(item, dict) and "token" in item:
+                        token = item["token"]
+                        if len(token) > 50:
+                            results.append({
+                                "token": token,
+                                "device_info": item.get("device_profile") or item.get("deviceInfo") or {},
+                                "password": item.get("password") or "",
+                                "phone": item.get("phone") or "",
+                                "custom_payload": str(item.get("customPayload", "")) if item.get("customPayload") else None
+                            })
+                if results:
+                    return results
             if isinstance(data, dict):
                 if "token" in data:
-                    parsed = TokenParser.parse_single_account(data)
-                    if parsed:
-                        results.append(parsed)
+                    token = data["token"]
+                    if len(token) > 50:
+                        results.append({
+                            "token": token,
+                            "device_info": data.get("device_profile") or data.get("deviceInfo") or {},
+                            "password": data.get("password") or "",
+                            "phone": data.get("phone") or "",
+                            "custom_payload": str(data.get("customPayload", "")) if data.get("customPayload") else None
+                        })
                         return results
-                for key in ["tokens", "accounts", "data", "sessions", "results"]:
-                    if key in data and isinstance(data[key], list):
-                        for item in data[key]:
-                            if isinstance(item, dict):
-                                parsed = TokenParser.parse_single_account(item)
-                                if parsed:
-                                    results.append(parsed)
-                        if results:
-                            return results
-                for key, value in data.items():
-                    if isinstance(value, list):
-                        for item in value:
-                            if isinstance(item, dict) and "token" in item:
-                                parsed = TokenParser.parse_single_account(item)
-                                if parsed:
-                                    results.append(parsed)
-                        if results:
-                            return results
         except:
             pass
         
@@ -388,9 +322,15 @@ class TokenParser:
             try:
                 data = json.loads(line)
                 if isinstance(data, dict) and "token" in data:
-                    parsed = TokenParser.parse_single_account(data)
-                    if parsed:
-                        results.append(parsed)
+                    token = data["token"]
+                    if len(token) > 50:
+                        results.append({
+                            "token": token,
+                            "device_info": data.get("device_profile") or data.get("deviceInfo") or {},
+                            "password": data.get("password") or "",
+                            "phone": data.get("phone") or "",
+                            "custom_payload": str(data.get("customPayload", "")) if data.get("customPayload") else None
+                        })
             except:
                 pass
         
@@ -408,7 +348,7 @@ class TokenParser:
             if not token:
                 continue
             
-            password = TokenParser.find_password(block)
+            password = TokenParser.extract_password(block)
             device_info = TokenParser.extract_device_info(block)
             custom_payload = TokenParser.extract_custom_payload(block)
             
@@ -424,37 +364,6 @@ class TokenParser:
             })
         
         return results
-    
-    @staticmethod
-    def parse_single_account(data: dict) -> dict:
-        token = data.get("token", "")
-        if not token or len(token) < 50:
-            return None
-        
-        phone = TokenParser.extract_phone_from_json(data)
-        device_info = TokenParser.extract_device_info_from_json(data)
-        
-        if "deviceId" not in device_info:
-            device_id = data.get("device_id", str(uuid.uuid4()))
-            device_info["deviceId"] = device_id
-        
-        # Ищем пароль во всем JSON
-        json_str = json.dumps(data)
-        password = TokenParser.find_password(json_str)
-        
-        custom_payload = data.get("customPayload") or data.get("custom_payload")
-        if custom_payload:
-            custom_payload = str(custom_payload)
-        
-        logger.info(f"Parsed: phone={phone}, password={password}, device_info={list(device_info.keys())}")
-        
-        return {
-            "token": token,
-            "device_info": device_info,
-            "password": password,
-            "phone": phone,
-            "custom_payload": custom_payload
-        }
 
 # ==================== ДАННЫЕ ====================
 
@@ -522,13 +431,18 @@ async def validate_token(token: str, device_id: str, device_info: dict = None) -
         
         now_ms = int(time.time() * 1000)
         user_agent = {
-            "deviceType": "ANDROID", "appVersion": "26.17.1", "osVersion": "Android 10",
-            "timezone": "Europe/Moscow", "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
-            "arch": "arm64-v8a", "locale": "ru", "buildNumber": 6712,
-            "deviceName": "Google Pixel 7", "deviceLocale": "ru"
+            "deviceType": device_info.get("deviceType", "ANDROID") if device_info else "ANDROID",
+            "appVersion": device_info.get("appVersion", "26.17.1") if device_info else "26.17.1",
+            "osVersion": device_info.get("osVersion", "Android 10") if device_info else "Android 10",
+            "timezone": device_info.get("timezone", "Europe/Moscow") if device_info else "Europe/Moscow",
+            "screen": device_info.get("screen", "408dpi 1080x2292") if device_info else "408dpi 1080x2292",
+            "pushDeviceType": "GCM",
+            "arch": device_info.get("arch", "arm64-v8a") if device_info else "arm64-v8a",
+            "locale": device_info.get("deviceLocale", device_info.get("locale", "ru")) if device_info else "ru",
+            "buildNumber": device_info.get("buildNumber", 6712) if device_info else 6712,
+            "deviceName": device_info.get("deviceName", "Android") if device_info else "Android",
+            "deviceLocale": device_info.get("deviceLocale", device_info.get("locale", "ru")) if device_info else "ru"
         }
-        if device_info:
-            user_agent.update(device_info)
         
         payload = {
             "clientSessionId": now_ms & 0x7FFFFFFF,
@@ -549,7 +463,6 @@ async def validate_token(token: str, device_id: str, device_info: dict = None) -
         logger.info(f"Response: {str(data)[:500]}")
         
         phone = deep_find_phone(data)
-        logger.info(f"Phone: {phone}")
         
         is_valid = True
         has_2fa = False
@@ -614,7 +527,14 @@ async def start(message: types.Message):
     valid = sum(1 for a in accounts.values() if a.get("status") == "valid")
     twofa = sum(1 for a in accounts.values() if a.get("status") == "2fa")
     await message.answer(
-        f"🤖 <b>MAX TOKEN CHECKER</b>\n\n📥 Загрузите файл с токенами (.txt, .json, .zip)\n🔍 Бот проверит все токены\n💾 Выгрузите рабочие токены в ZIP\n📄 Каждый токен в отдельном файле\n\n📊 <b>В базе:</b> {len(accounts)}\n✅ Рабочих: {valid}\n🔐 2FA: {twofa}",
+        f"🤖 <b>MAX TOKEN CHECKER</b>\n\n"
+        f"📥 Загрузите файл с токенами (.txt, .json, .zip)\n"
+        f"🔍 Бот проверит все токены\n"
+        f"💾 Выгрузите рабочие токены в ZIP\n"
+        f"📄 Каждый токен в отдельном файле\n\n"
+        f"📊 <b>В базе:</b> {len(accounts)}\n"
+        f"✅ Рабочих: {valid}\n"
+        f"🔐 2FA: {twofa}",
         parse_mode="HTML", reply_markup=main_keyboard()
     )
 
