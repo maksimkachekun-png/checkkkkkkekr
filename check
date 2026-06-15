@@ -237,21 +237,21 @@ class TokenParser:
     @staticmethod
     def extract_password(text: str) -> str:
         """Ищет пароль в тексте"""
-        # Ищем после JSON перед const customPayload
+        # После JSON перед const customPayload
         match = re.search(r'\}\s*([A-Za-z0-9@#$%^&*!]+)\s*(?:const\s+customPayload|$)', text)
         if match:
             pwd = match.group(1)
             if 6 <= len(pwd) <= 50:
                 return pwd
         
-        # Ищем на следующей строке после }
+        # На следующей строке после }
         match = re.search(r'\}\n\s*([A-Za-z0-9@#$%^&*!]+)', text)
         if match:
             pwd = match.group(1)
             if 6 <= len(pwd) <= 50:
                 return pwd
         
-        # Ищем строку со спецсимволами
+        # Строка со спецсимволами
         lines = text.strip().split('\n')
         for line in lines:
             line = line.strip()
@@ -262,7 +262,7 @@ class TokenParser:
             if re.search(r'[!@#$%^&*]', line):
                 return line
         
-        # Ищем строку после JSON
+        # Строка после JSON (буквы + цифры/спецсимволы)
         for i, line in enumerate(lines):
             line = line.strip()
             if not line:
@@ -399,15 +399,15 @@ def deep_find_phone(data, depth=0):
             user = data["user"]
             if isinstance(user, dict):
                 phone = user.get("phone", "")
-                if phone and isinstance(phone, str) and len(phone) >= 10:
+                if phone and isinstance(phone, (str, int)) and len(str(phone)) >= 10:
                     return str(phone)
         for key in ["phone", "phoneNumber", "login"]:
             val = data.get(key, "")
-            if isinstance(val, str) and len(val) >= 10 and any(c.isdigit() for c in val):
+            if isinstance(val, (str, int)) and len(str(val)) >= 10 and any(c.isdigit() for c in str(val)):
                 return str(val)
         for key, value in data.items():
-            if isinstance(value, str) and len(value) >= 10:
-                cleaned = re.sub(r'[\s\(\)\-]', '', value)
+            if isinstance(value, (str, int)) and len(str(value)) >= 10:
+                cleaned = re.sub(r'[\s\(\)\-]', '', str(value))
                 if cleaned.isdigit() and len(cleaned) >= 10:
                     return cleaned
             elif isinstance(value, (dict, list)):
@@ -531,7 +531,7 @@ async def start(message: types.Message):
         f"📥 Загрузите файл с токенами (.txt, .json, .zip)\n"
         f"🔍 Бот проверит все токены\n"
         f"💾 Выгрузите рабочие токены в ZIP\n"
-        f"📄 Каждый токен в отдельном файле\n\n"
+        f"📄 Каждый токен в формате JSON\n\n"
         f"📊 <b>В базе:</b> {len(accounts)}\n"
         f"✅ Рабочих: {valid}\n"
         f"🔐 2FA: {twofa}",
@@ -770,8 +770,35 @@ async def export_tokens(message_or_callback, accs: dict, prefix: str):
                 password = acc.get("password", "")
                 status = acc.get("status", "")
                 device_info = acc.get("device_info", {})
-                custom_payload = acc.get("custom_payload", "")
                 device_id = acc.get("device_id", "")
+                
+                # Формируем полный JSON для основного бота
+                full_data = {
+                    "token": token,
+                    "deviceType": device_info.get("deviceType", "ANDROID"),
+                    "appVersion": device_info.get("appVersion", "26.17.1"),
+                    "osVersion": device_info.get("osVersion", "Android 10"),
+                    "timezone": device_info.get("timezone", "Europe/Moscow"),
+                    "screen": device_info.get("screen", "408dpi 1080x2292"),
+                    "pushDeviceType": "GCM",
+                    "arch": device_info.get("arch", "arm64-v8a"),
+                    "locale": device_info.get("locale", device_info.get("deviceLocale", "ru")),
+                    "buildNumber": device_info.get("buildNumber", 6712),
+                    "deviceName": device_info.get("deviceName", "Google Pixel 7"),
+                    "deviceLocale": device_info.get("deviceLocale", device_info.get("locale", "ru")),
+                    "deviceId": device_id,
+                    "clientSessionId": int(time.time() * 1000) & 0x7FFFFFFF,
+                    "user": {
+                        "user_id": 0,
+                        "phone": int(phone) if phone and phone.isdigit() else 0,
+                        "photo_id": None,
+                        "first_name": "",
+                        "last_name": ""
+                    },
+                    "password": password
+                }
+                
+                # Имя файла
                 if phone:
                     filename = f"{phone}"
                 else:
@@ -780,19 +807,11 @@ async def export_tokens(message_or_callback, accs: dict, prefix: str):
                     filename += f"_pass_{password}"
                 if status == "2fa":
                     filename += "_2FA"
-                content = token + "\n"
-                if device_info and isinstance(device_info, dict) and len(device_info) > 0:
-                    info = device_info.copy()
-                    if "deviceId" not in info:
-                        info["deviceId"] = device_id
-                    content += json.dumps(info, ensure_ascii=False) + "\n"
-                else:
-                    content += json.dumps({"deviceId": device_id}, ensure_ascii=False) + "\n"
-                if password:
-                    content += password + "\n"
-                if custom_payload:
-                    content += f'const customPayload = "{custom_payload}";\n'
-                zf.writestr(f"{filename}.txt", content)
+                
+                # Сохраняем как JSON
+                content = json.dumps(full_data, ensure_ascii=False, indent=2)
+                zf.writestr(f"{filename}.json", content)
+        
         zip_buffer.seek(0)
         temp_file = f"export_{prefix}_{int(time.time())}.zip"
         with open(temp_file, 'wb') as f:
